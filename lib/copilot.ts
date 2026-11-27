@@ -154,35 +154,45 @@ export async function chat(history: ChatTurn[], ctx: { asOf: string; scenario: S
   const trace: ToolTrace[] = []; const proposals: Proposal[] = [];
   const started = Date.now();
   const BUDGET_MS = Number(process.env.COPILOT_BUDGET_MS || 50000); // stay under the hosting time limit
-  let thinkingCfg: Json | null = { thinkingConfig: { thinkingLevel: "low" } }; // faster answers; dropped if the model rejects it
+  // Busy or unavailable models (503/429/5xx/404/timeout) fall through to the next one in this list.
+  const models = [...new Set([model, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash").split(",").map((m) => m.trim()).filter(Boolean)])];
+  let mi = 0;
+  let thinkingCfg: Json | null = { thinkingConfig: { thinkingLevel: "low" } }; // faster answers; dropped if a model rejects it
+  const failures: string[] = [];
+  let res: Response | null = null;
   for (let step = 0; step < 6; step++) {
-    const left = BUDGET_MS - (Date.now() - started);
-    if (left < 4000) return { reply: `This question needed more time than the server allows (${Math.round((Date.now() - started) / 1000)}s so far). Try a narrower question, e.g. one campaign or one metric.`, trace, proposals, error: "time_budget" };
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), Math.min(left - 1000, 30000));
-    let res: Response;
-    const t0 = Date.now();
-    try {
-      res = await f(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey }, signal: ctrl.signal,
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: systemPrompt(ctx) }] }, contents, tools: [{ functionDeclarations: TOOL_DECLARATIONS }], generationConfig: { temperature: 0.2, ...(thinkingCfg || {}) } }),
-      });
-    } catch (e) {
-      clearTimeout(timer);
-      const aborted = (e as Error).name === "AbortError";
-      console.error(`[copilot] step ${step} ${aborted ? "timed out" : "network error"} after ${Date.now() - t0}ms`, (e as Error).message);
-      return { reply: aborted ? `Gemini took too long to respond (model '${model}'). Try again, or set GEMINI_MODEL to a faster Flash model.` : `Couldn’t reach Gemini: ${(e as Error).message}`, trace, proposals, error: aborted ? "timeout" : "network" };
-    } finally { clearTimeout(timer); }
-    console.log(`[copilot] step ${step} model=${model} status=${res.status} ${Date.now() - t0}ms`);
-    if (!res.ok && res.status === 400 && thinkingCfg) {
-      const txt = await res.clone().text();
-      if (/thinking/i.test(txt)) { thinkingCfg = null; step--; continue; } // model doesn't support thinkingLevel: retry without it
+    res = null;
+    while (mi < models.length) {
+      const left = BUDGET_MS - (Date.now() - started);
+      if (left < 3000) break;
+      const m = models[mi];
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), Math.min(left - 1000, 20000));
+      const t0 = Date.now();
+      try {
+        const r = await f(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent`, {
+          method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey }, signal: ctrl.signal,
+          body: JSON.stringify({ systemInstruction: { parts: [{ text: systemPrompt(ctx) }] }, contents, tools: [{ functionDeclarations: TOOL_DECLARATIONS }], generationConfig: { temperature: 0.2, ...(thinkingCfg || {}) } }),
+        });
+        console.log(`[copilot] step ${step} model=${m} status=${r.status} ${Date.now() - t0}ms`);
+        if (r.ok) { res = r; break; }
+        const txt = await r.text();
+        if (r.status === 400 && thinkingCfg && /thinking/i.test(txt)) { thinkingCfg = null; continue; } // retry same model without thinkingLevel
+        if (r.status === 400 && /signature/i.test(txt)) { for (const c of contents) for (const p of c.parts) delete p.thoughtSignature; continue; }
+        if ([403].includes(r.status)) return { reply: "Gemini refused the API key (403). Check GEMINI_API_KEY in Vercel.", trace, proposals, error: txt.slice(0, 300) };
+        if (r.status === 400) return { reply: `Gemini rejected the request (400) for model '${m}'.`, trace, proposals, error: txt.slice(0, 500) };
+        failures.push(`${m}: ${r.status}`);
+        if (r.status === 503 || r.status === 500) await new Promise((ok) => setTimeout(ok, 600));
+      } catch (e) {
+        failures.push(`${m}: ${(e as Error).name === "AbortError" ? "timeout" : "network"}`);
+        console.error(`[copilot] step ${step} model=${m} failed after ${Date.now() - t0}ms`, (e as Error).message);
+      } finally { clearTimeout(timer); }
+      mi++; // move to the next model and stay on it for the rest of this answer
+      for (const c of contents) for (const p of c.parts) delete p.thoughtSignature; // signatures don't carry across models
     }
-    if (!res.ok) {
-      const txt = await res.text();
-      console.error(`[copilot] Gemini ${res.status}: ${txt.slice(0, 300)}`);
-      const reason = res.status === 429 ? "The free Gemini quota is busy (rate limit). Wait a minute and try again." : res.status === 400 || res.status === 404 ? `Gemini rejected the request (${res.status}). Check GEMINI_MODEL (currently '${model}') and the API key.` : res.status === 403 ? "Gemini refused the API key (403). Check GEMINI_API_KEY." : `Gemini error ${res.status}.`;
-      return { reply: reason, trace, proposals, error: txt.slice(0, 500) };
+    if (!res) {
+      const busy = failures.some((x) => /429/.test(x));
+      return { reply: busy ? "Gemini’s free quota is busy right now (rate limit). Wait a minute and ask again." : `Google’s Gemini models are overloaded right now (${failures.join(", ") || "time limit reached"}). Please try again in a minute.`, trace, proposals, error: failures.join("; ") || "time_budget" };
     }
     const j = await res.json();
     const cand = j.candidates?.[0];

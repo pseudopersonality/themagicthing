@@ -15,21 +15,23 @@ export async function POST(req: Request) {
   } catch (e) { return json({ reply: `Something went wrong: ${(e as Error).message}`, trace: [], proposals: [], error: "exception" }); }
 }
 
-// Diagnostic: open /api/chat in a browser to test the Gemini key and model without tools.
+// Diagnostic: open /api/chat in a browser to test the key and each model in the fallback chain.
 export async function GET() {
-  const key = process.env.GEMINI_API_KEY, model = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+  const key = process.env.GEMINI_API_KEY, primary = process.env.GEMINI_MODEL || "gemini-3.8-flash";
   if (!key) return json({ ok: false, problem: "GEMINI_API_KEY is not set in Vercel → Settings → Environment Variables (then redeploy)." });
-  const t0 = Date.now();
-  const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 25000);
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST", signal: ctrl.signal, headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Reply with exactly: OK" }] }] }),
-    });
-    const txt = await r.text();
-    let reply = ""; try { reply = JSON.parse(txt).candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text || "").join("") || ""; } catch {}
-    return json({ ok: r.ok, model, httpStatus: r.status, ms: Date.now() - t0, reply: reply.slice(0, 100), googleError: r.ok ? undefined : txt.slice(0, 600) });
-  } catch (e) {
-    return json({ ok: false, model, ms: Date.now() - t0, problem: (e as Error).name === "AbortError" ? "Gemini did not answer within 25s." : (e as Error).message });
-  } finally { clearTimeout(timer); }
+  const models = [...new Set([primary, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash").split(",").map((m) => m.trim()).filter(Boolean)])];
+  const results = [];
+  for (const model of models) {
+    const t0 = Date.now(); const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST", signal: ctrl.signal, headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Reply with exactly: OK" }] }] }),
+      });
+      const txt = await r.text();
+      results.push({ model, ok: r.ok, httpStatus: r.status, ms: Date.now() - t0, note: r.ok ? "works" : txt.replace(/\s+/g, " ").slice(0, 160) });
+    } catch (e) { results.push({ model, ok: false, ms: Date.now() - t0, note: (e as Error).name === "AbortError" ? "no answer within 12s" : (e as Error).message }); }
+    finally { clearTimeout(timer); }
+  }
+  return json({ copilotWillWork: results.some((r) => r.ok), firstWorkingModel: results.find((r) => r.ok)?.model || null, results });
 }
