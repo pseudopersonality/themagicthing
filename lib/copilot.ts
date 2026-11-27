@@ -152,14 +152,36 @@ export async function chat(history: ChatTurn[], ctx: { asOf: string; scenario: S
   const f = opts.fetchImpl ?? fetch;
   const contents: Content[] = history.slice(-12).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.text.slice(0, 4000) }] }));
   const trace: ToolTrace[] = []; const proposals: Proposal[] = [];
-  for (let step = 0; step < 8; step++) {
-    const res = await f(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: systemPrompt(ctx) }] }, contents, tools: [{ functionDeclarations: TOOL_DECLARATIONS }], generationConfig: { temperature: 0.2 } }),
-    });
+  const started = Date.now();
+  const BUDGET_MS = Number(process.env.COPILOT_BUDGET_MS || 50000); // stay under the hosting time limit
+  let thinkingCfg: Json | null = { thinkingConfig: { thinkingLevel: "low" } }; // faster answers; dropped if the model rejects it
+  for (let step = 0; step < 6; step++) {
+    const left = BUDGET_MS - (Date.now() - started);
+    if (left < 4000) return { reply: `This question needed more time than the server allows (${Math.round((Date.now() - started) / 1000)}s so far). Try a narrower question, e.g. one campaign or one metric.`, trace, proposals, error: "time_budget" };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.min(left - 1000, 30000));
+    let res: Response;
+    const t0 = Date.now();
+    try {
+      res = await f(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey }, signal: ctrl.signal,
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: systemPrompt(ctx) }] }, contents, tools: [{ functionDeclarations: TOOL_DECLARATIONS }], generationConfig: { temperature: 0.2, ...(thinkingCfg || {}) } }),
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      const aborted = (e as Error).name === "AbortError";
+      console.error(`[copilot] step ${step} ${aborted ? "timed out" : "network error"} after ${Date.now() - t0}ms`, (e as Error).message);
+      return { reply: aborted ? `Gemini took too long to respond (model '${model}'). Try again, or set GEMINI_MODEL to a faster Flash model.` : `Couldn’t reach Gemini: ${(e as Error).message}`, trace, proposals, error: aborted ? "timeout" : "network" };
+    } finally { clearTimeout(timer); }
+    console.log(`[copilot] step ${step} model=${model} status=${res.status} ${Date.now() - t0}ms`);
+    if (!res.ok && res.status === 400 && thinkingCfg) {
+      const txt = await res.clone().text();
+      if (/thinking/i.test(txt)) { thinkingCfg = null; step--; continue; } // model doesn't support thinkingLevel: retry without it
+    }
     if (!res.ok) {
       const txt = await res.text();
-      const reason = res.status === 429 ? "The free Gemini quota is busy (rate limit). Wait a minute and try again." : res.status === 400 || res.status === 404 ? `Gemini rejected the request (${res.status}). Check GEMINI_MODEL (currently '${model}') and the API key.` : `Gemini error ${res.status}.`;
+      console.error(`[copilot] Gemini ${res.status}: ${txt.slice(0, 300)}`);
+      const reason = res.status === 429 ? "The free Gemini quota is busy (rate limit). Wait a minute and try again." : res.status === 400 || res.status === 404 ? `Gemini rejected the request (${res.status}). Check GEMINI_MODEL (currently '${model}') and the API key.` : res.status === 403 ? "Gemini refused the API key (403). Check GEMINI_API_KEY." : `Gemini error ${res.status}.`;
       return { reply: reason, trace, proposals, error: txt.slice(0, 500) };
     }
     const j = await res.json();
