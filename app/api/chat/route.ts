@@ -19,7 +19,7 @@ export async function POST(req: Request) {
 export async function GET() {
   const key = process.env.GEMINI_API_KEY, primary = process.env.GEMINI_MODEL || "gemini-3.8-flash";
   if (!key) return json({ ok: false, problem: "GEMINI_API_KEY is not set in Vercel → Settings → Environment Variables (then redeploy)." });
-  const models = [...new Set([primary, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash").split(",").map((m) => m.trim()).filter(Boolean)])];
+  const models = [...new Set([primary, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-lite-latest,gemini-flash-latest").split(",").map((m) => m.trim()).filter(Boolean)])];
   const results = [];
   for (const model of models) {
     const t0 = Date.now(); const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 12000);

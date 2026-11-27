@@ -155,7 +155,11 @@ export async function chat(history: ChatTurn[], ctx: { asOf: string; scenario: S
   const started = Date.now();
   const BUDGET_MS = Number(process.env.COPILOT_BUDGET_MS || 50000); // stay under the hosting time limit
   // Busy or unavailable models (503/429/5xx/404/timeout) fall through to the next one in this list.
-  const models = [...new Set([model, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash").split(",").map((m) => m.trim()).filter(Boolean)])];
+  const chain = [...new Set([model, ...(process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-lite-latest,gemini-flash-latest").split(",").map((m) => m.trim()).filter(Boolean)])];
+  // Skip models that failed in the last few minutes (remembered across requests on this server instance).
+  const cool = (globalThis as unknown as { __csCool?: Map<string, number> }).__csCool ??= new Map<string, number>();
+  const healthy = chain.filter((m) => (cool.get(m) || 0) < Date.now());
+  const models = healthy.length ? healthy : chain;
   let mi = 0;
   let thinkingCfg: Json | null = { thinkingConfig: { thinkingLevel: "low" } }; // faster answers; dropped if a model rejects it
   const failures: string[] = [];
@@ -167,7 +171,7 @@ export async function chat(history: ChatTurn[], ctx: { asOf: string; scenario: S
       if (left < 3000) break;
       const m = models[mi];
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), Math.min(left - 1000, 20000));
+      const timer = setTimeout(() => ctrl.abort(), Math.min(left - 1000, step === 0 ? 12000 : 20000));
       const t0 = Date.now();
       try {
         const r = await f(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent`, {
@@ -187,6 +191,7 @@ export async function chat(history: ChatTurn[], ctx: { asOf: string; scenario: S
         failures.push(`${m}: ${(e as Error).name === "AbortError" ? "timeout" : "network"}`);
         console.error(`[copilot] step ${step} model=${m} failed after ${Date.now() - t0}ms`, (e as Error).message);
       } finally { clearTimeout(timer); }
+      cool.set(m, Date.now() + 5 * 60_000); // rest this model for 5 minutes
       mi++; // move to the next model and stay on it for the rest of this answer
       for (const c of contents) for (const p of c.parts) delete p.thoughtSignature; // signatures don't carry across models
     }
